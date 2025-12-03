@@ -437,11 +437,12 @@ class NervousSystem(Updatable):
 # ================================================================
 
 @dataclass
-class Muscle(MetabolicOrgan, SignalTarget):
+class Muscle(MetabolicOrgan, SignalTarget, CirculationSink):
     """
     Simple muscle that can be activated by neural signals.
     """
     activation: float = 0.0  # 0.0–1.0
+    oxygen_debt: float = 0.0
 
     def receive_signal(self, signal_name: str, magnitude: float) -> None:
         """
@@ -460,6 +461,16 @@ class Muscle(MetabolicOrgan, SignalTarget):
         # Example placeholder: decay activation slightly over time
         decay_rate = 0.1
         self.activation = max(0.0, self.activation - decay_rate * ctx.dt_seconds)
+
+    def receive_flow(self, volume_ml: float, oxygen_fraction: float) -> None:
+        """
+        Receive blood flow and update simple oxygen debt tracking.
+        """
+        # Very coarse model: reduce oxygen debt based on available oxygen and activation.
+        # In a richer simulation, this would feed into metabolism and force production.
+        oxygen_available = volume_ml * oxygen_fraction
+        oxygen_use = min(oxygen_available, self.activation * 10.0)
+        self.oxygen_debt = max(0.0, self.oxygen_debt - oxygen_use)
 
 
 @dataclass
@@ -712,7 +723,7 @@ def create_default_body(sex: Sex = Sex.MALE) -> Body:
     # Register tissues as circulation sinks (e.g., muscles, lungs)
     circulatory.register_sink(lungs)
     for muscle in muscles.values():
-        circulatory.register_sink(muscle)  # type: ignore[arg-type]
+        circulatory.register_sink(muscle)
 
     # Create body
     body = Body(
@@ -724,7 +735,7 @@ def create_default_body(sex: Sex = Sex.MALE) -> Body:
         respiratory=respiratory,
         nervous=nervous,
         musculoskeletal=musculoskeletal,
-        digestive=digestive,  # noqa: F821  (typo fix in next line)
+        digestive=digestive,
     )
 
     return body
