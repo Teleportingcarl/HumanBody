@@ -124,6 +124,8 @@ class VitalSigns:
     diastolic_bp_mmHg: float = 80.0
     body_temperature_c: float = 37.0
     oxygen_saturation_pct: float = 98.0
+    blood_glucose_mg_dl: float = 90.0
+    hydration_pct: float = 100.0
 
 
 # ================================================================
@@ -410,6 +412,7 @@ class NervousSystem(Updatable):
     """
     central: NeuralNetwork
     signal_targets: Dict[str, SignalTarget] = field(default_factory=dict)
+    basal_metabolic_rate_watts: float = 20.0
 
     def register_target(self, name: str, target: SignalTarget) -> None:
         """
@@ -430,6 +433,12 @@ class NervousSystem(Updatable):
         Update nervous system state.
         """
         self.central.step(ctx)
+
+    def energy_demand_watts(self) -> float:
+        """
+        Approximate metabolic demand of nervous tissue.
+        """
+        return self.basal_metabolic_rate_watts
 
 
 # ================================================================
@@ -524,6 +533,134 @@ class MusculoskeletalSystem(Updatable):
 
 
 # ================================================================
+# ENDOCRINE SYSTEM
+# ================================================================
+
+@dataclass
+class Hormone:
+    """
+    Simplified hormone representation for signaling between systems.
+    """
+    name: str
+    concentration_ng_ml: float
+    half_life_s: float
+
+    def decay(self, ctx: TimeStepContext) -> None:
+        """
+        Exponentially decay hormone concentration over time.
+        """
+        if self.concentration_ng_ml <= 0:
+            return
+        decay_constant = 0.693 / max(self.half_life_s, 1e-6)
+        self.concentration_ng_ml *= max(0.0, 1.0 - decay_constant * ctx.dt_seconds)
+
+
+@dataclass
+class EndocrineSystem(Updatable):
+    """
+    Simple endocrine scaffold tracking circulating hormones.
+    """
+    hormones: Dict[str, Hormone] = field(default_factory=dict)
+    basal_metabolic_rate_watts: float = 5.0
+
+    def release(self, name: str, amount_ng_ml: float, half_life_s: float = 60.0) -> None:
+        """
+        Add or increase a hormone level in circulation.
+        """
+        hormone = self.hormones.get(name)
+        if hormone is None:
+            hormone = Hormone(name=name, concentration_ng_ml=0.0, half_life_s=half_life_s)
+            self.hormones[name] = hormone
+        hormone.concentration_ng_ml += amount_ng_ml
+
+    def level(self, name: str) -> float:
+        """
+        Retrieve current concentration for a hormone, if present.
+        """
+        hormone = self.hormones.get(name)
+        return hormone.concentration_ng_ml if hormone else 0.0
+
+    def step(self, ctx: TimeStepContext) -> None:
+        """
+        Decay hormone levels each timestep.
+        """
+        for hormone in self.hormones.values():
+            hormone.decay(ctx)
+
+    def energy_demand_watts(self) -> float:
+        """
+        Minimal metabolic cost for hormonal regulation.
+        """
+        return self.basal_metabolic_rate_watts
+
+
+# ================================================================
+# HEPATIC SYSTEM
+# ================================================================
+
+@dataclass
+class Liver(MetabolicOrgan, CirculationSink):
+    """
+    Liver scaffold for detoxification and glycogen storage.
+    """
+    glycogen_store_kcal: float = 300.0
+    glycogen_capacity_kcal: float = 600.0
+
+    def receive_flow(self, volume_ml: float, oxygen_fraction: float) -> None:
+        """
+        Placeholder for hepatic blood flow handling.
+        """
+        # A full model would track toxin clearance and nutrient processing.
+        return
+
+
+@dataclass
+class HepaticSystem(Updatable):
+    """
+    Collection of hepatic functions, primarily the liver.
+    """
+    liver: Liver
+    blood_glucose_mg_dl: float = 90.0
+
+    def manage_energy(self, absorbed_kcal: float, body_energy_kcal: float) -> float:
+        """
+        Route absorbed calories to glycogen storage and release when low.
+        Returns net calories available to general body stores.
+        """
+        available_for_body = 0.0
+
+        # Store newly absorbed calories until glycogen capacity is reached.
+        if absorbed_kcal > 0:
+            capacity_remaining = max(0.0, self.liver.glycogen_capacity_kcal - self.liver.glycogen_store_kcal)
+            stored = min(absorbed_kcal, capacity_remaining)
+            self.liver.glycogen_store_kcal += stored
+            available_for_body += absorbed_kcal - stored
+
+        # Release glycogen if systemic energy is low.
+        if body_energy_kcal < 1500.0 and self.liver.glycogen_store_kcal > 0:
+            release = min(50.0, self.liver.glycogen_store_kcal)
+            self.liver.glycogen_store_kcal -= release
+            available_for_body += release
+
+        # Update a coarse blood glucose estimate from glycogen status.
+        fill_ratio = 0.0 if self.liver.glycogen_capacity_kcal <= 0 else self.liver.glycogen_store_kcal / self.liver.glycogen_capacity_kcal
+        self.blood_glucose_mg_dl = 70.0 + (fill_ratio * 40.0)
+
+        return available_for_body
+
+    def step(self, ctx: TimeStepContext) -> None:
+        """
+        Placeholder for hepatic time-dependent processes.
+        """
+        self.liver.step(ctx)
+
+    def energy_demand_watts(self) -> float:
+        """
+        Metabolic demand of hepatic tissue.
+        """
+        return self.liver.energy_demand_watts()
+
+# ================================================================
 # DIGESTIVE + METABOLIC SYSTEM
 # ================================================================
 
@@ -572,6 +709,95 @@ class DigestiveSystem(Updatable):
 
 
 # ================================================================
+# RENAL SYSTEM
+# ================================================================
+
+@dataclass
+class Kidney(MetabolicOrgan, CirculationSink):
+    """
+    Simple kidney scaffold for filtration and fluid balance.
+    """
+    filtration_rate_ml_per_min: float = 90.0
+    hydration_contribution_pct: float = 0.0
+
+    def receive_flow(self, volume_ml: float, oxygen_fraction: float) -> None:
+        """
+        Receive renal blood flow; placeholder for solute handling.
+        """
+        # A full model would calculate urine formation and electrolyte changes.
+        return
+
+
+@dataclass
+class RenalSystem(Updatable):
+    """
+    Coarse renal model coordinating kidneys and hydration tracking.
+    """
+    kidneys: List[Kidney]
+    hydration_level_pct: float = 100.0
+
+    def _estimate_urine_output(self, ctx: TimeStepContext) -> float:
+        """
+        Estimate urine production from total filtration.
+        """
+        total_filtration_ml_per_s = sum(k.filtration_rate_ml_per_min for k in self.kidneys) / 60.0
+        return total_filtration_ml_per_s * ctx.dt_seconds * 0.2  # assume 20% becomes urine
+
+    def step(self, ctx: TimeStepContext) -> None:
+        """
+        Update kidney processes and hydration estimate.
+        """
+        urine_output_ml = self._estimate_urine_output(ctx)
+
+        # Adjust hydration level heuristically.
+        hydration_change = -urine_output_ml / 3000.0 * 100.0  # relative to a nominal 3L
+        self.hydration_level_pct = max(0.0, min(120.0, self.hydration_level_pct + hydration_change))
+
+    def energy_demand_watts(self) -> float:
+        """
+        Sum of metabolic demand from both kidneys.
+        """
+        return sum(k.energy_demand_watts() for k in self.kidneys)
+
+
+# ================================================================
+# IMMUNE SYSTEM
+# ================================================================
+
+@dataclass
+class ImmuneSystem(Updatable):
+    """
+    Minimal immune activity tracker.
+    """
+    activation_level: float = 0.1  # 0–1
+    pathogen_load: float = 0.0
+    basal_metabolic_rate_watts: float = 5.0
+
+    def challenge(self, load: float) -> None:
+        """
+        Introduce a pathogen load that the immune system must fight.
+        """
+        self.pathogen_load += max(0.0, load)
+        self.activation_level = min(1.0, self.activation_level + load / 1000.0)
+
+    def step(self, ctx: TimeStepContext) -> None:
+        """
+        Reduce pathogen load proportional to activation.
+        """
+        clearance_rate = self.activation_level * 10.0 * ctx.dt_seconds
+        self.pathogen_load = max(0.0, self.pathogen_load - clearance_rate)
+
+        # Activation slowly relaxes toward baseline when load is low.
+        if self.pathogen_load <= 0:
+            self.activation_level = max(0.1, self.activation_level - 0.01 * ctx.dt_seconds)
+
+    def energy_demand_watts(self) -> float:
+        """
+        Metabolic demand increases with immune activation.
+        """
+        return self.basal_metabolic_rate_watts * (1.0 + self.activation_level)
+
+# ================================================================
 # HIGH-LEVEL BODY OBJECT
 # ================================================================
 
@@ -589,8 +815,12 @@ class Body(Updatable):
     circulatory: CirculatorySystem
     respiratory: RespiratorySystem
     nervous: NervousSystem
+    endocrine: EndocrineSystem
+    hepatic: HepaticSystem
+    renal: RenalSystem
     musculoskeletal: MusculoskeletalSystem
     digestive: DigestiveSystem
+    immune: ImmuneSystem
 
     energy_stores_kcal: float = 2000.0
 
@@ -600,10 +830,14 @@ class Body(Updatable):
         """
         # Step sub-systems
         self.nervous.step(ctx)
+        self.endocrine.step(ctx)
         self.musculoskeletal.step(ctx)
         self.respiratory.step(ctx)
         self.circulatory.step(ctx)
         self.digestive.step(ctx)
+        self.hepatic.step(ctx)
+        self.renal.step(ctx)
+        self.immune.step(ctx)
 
         # Integrate metabolic flows
         self._update_energy_balance(ctx)
@@ -626,6 +860,21 @@ class Body(Updatable):
         for m in self.musculoskeletal.muscles.values():
             total_watts += m.energy_demand_watts()
 
+        # Brain and peripheral nerves
+        total_watts += self.nervous.energy_demand_watts()
+
+        # Endocrine regulation
+        total_watts += self.endocrine.energy_demand_watts()
+
+        # Hepatic processes
+        total_watts += self.hepatic.energy_demand_watts()
+
+        # Renal filtration
+        total_watts += self.renal.energy_demand_watts()
+
+        # Immune activity
+        total_watts += self.immune.energy_demand_watts()
+
         # Convert Watts to kcal/s (1 Watt = 1 Joule/s; 1 kcal ≈ 4184 Joules)
         kcal_per_s = total_watts / 4184.0
         kcal_used = kcal_per_s * ctx.dt_seconds
@@ -635,7 +884,8 @@ class Body(Updatable):
 
         # Add calories absorbed from digestion
         absorbed_kcal = self.digestive.pop_last_absorbed()
-        self.energy_stores_kcal += absorbed_kcal
+        absorbed_for_body = self.hepatic.manage_energy(absorbed_kcal, self.energy_stores_kcal)
+        self.energy_stores_kcal += absorbed_for_body
 
     def _update_vital_signs(self, ctx: TimeStepContext) -> None:
         """
@@ -649,6 +899,10 @@ class Body(Updatable):
         # Simple heuristic: more energy → slightly higher temperature
         delta_temp = (self.energy_stores_kcal - 2000.0) / 10000.0
         self.vital_signs.body_temperature_c = baseline_temp + delta_temp
+
+        # Track coarse blood glucose and hydration
+        self.vital_signs.blood_glucose_mg_dl = self.hepatic.blood_glucose_mg_dl
+        self.vital_signs.hydration_pct = self.renal.hydration_level_pct
 
 
 # ================================================================
@@ -675,6 +929,13 @@ def create_default_body(sex: Sex = Sex.MALE) -> Body:
         basal_metabolic_rate_watts=10.0,
     )
 
+    liver = Liver(
+        name="Liver",
+        mass_kg=1.5,
+        basal_metabolic_rate_watts=18.0,
+        glycogen_store_kcal=350.0,
+    )
+
     # Create blood compartments
     arterial = BloodCompartment(volume_ml=2500.0, oxygen_fraction=0.98)
     venous = BloodCompartment(volume_ml=2500.0, oxygen_fraction=0.75)
@@ -692,6 +953,29 @@ def create_default_body(sex: Sex = Sex.MALE) -> Body:
     # Create nervous system
     brain_network = NeuralNetwork()
     nervous = NervousSystem(central=brain_network)
+
+    # Create endocrine system with a couple of baseline hormones
+    endocrine = EndocrineSystem()
+    endocrine.release("insulin", amount_ng_ml=5.0, half_life_s=240.0)
+    endocrine.release("adrenaline", amount_ng_ml=0.5, half_life_s=120.0)
+
+    # Create hepatic system
+    hepatic = HepaticSystem(liver=liver)
+
+    # Create renal system
+    kidney_left = Kidney(
+        name="Left Kidney",
+        mass_kg=0.15,
+        basal_metabolic_rate_watts=6.0,
+        filtration_rate_ml_per_min=95.0,
+    )
+    kidney_right = Kidney(
+        name="Right Kidney",
+        mass_kg=0.15,
+        basal_metabolic_rate_watts=6.0,
+        filtration_rate_ml_per_min=95.0,
+    )
+    renal = RenalSystem(kidneys=[kidney_left, kidney_right])
 
     # Create musculoskeletal system (very minimal)
     femur = Bone(name="Femur", length_m=0.45, mass_kg=4.0)
@@ -720,10 +1004,16 @@ def create_default_body(sex: Sex = Sex.MALE) -> Body:
     # Digestive system
     digestive = DigestiveSystem()
 
+    # Immune system
+    immune = ImmuneSystem()
+
     # Register tissues as circulation sinks (e.g., muscles, lungs)
     circulatory.register_sink(lungs)
     for muscle in muscles.values():
         circulatory.register_sink(muscle)
+    circulatory.register_sink(liver)
+    circulatory.register_sink(kidney_left)
+    circulatory.register_sink(kidney_right)
 
     # Create body
     body = Body(
@@ -734,8 +1024,12 @@ def create_default_body(sex: Sex = Sex.MALE) -> Body:
         circulatory=circulatory,
         respiratory=respiratory,
         nervous=nervous,
+        endocrine=endocrine,
+        hepatic=hepatic,
+        renal=renal,
         musculoskeletal=musculoskeletal,
         digestive=digestive,
+        immune=immune,
     )
 
     return body
